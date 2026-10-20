@@ -10,15 +10,76 @@ use anyhow::anyhow;
 use clap::Parser;
 use rustls::crypto::aws_lc_rs;
 use std::io::IsTerminal;
+use std::os::fd::AsFd;
+use std::os::unix::fs::MetadataExt;
+use tracing::Event;
+use tracing::Level;
+use tracing::Subscriber;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt;
+use tracing_subscriber::fmt::FmtContext;
+use tracing_subscriber::fmt::FormatEvent;
+use tracing_subscriber::fmt::FormatFields;
+use tracing_subscriber::fmt::format::Writer;
 use tracing_subscriber::prelude::*;
+use tracing_subscriber::registry::LookupSpan;
 use vector_store::ConfigManager;
 use vector_store::Info;
 
 #[derive(Parser)]
 #[clap(version)]
 struct Args {}
+
+/// Prefixes each log line with an sd-daemon `<N>` priority so journald records the real level
+/// instead of the unit's default (info) for everything written to stdout.
+struct SyslogPrefix<F> {
+    enabled: bool,
+    inner: F,
+}
+
+fn syslog_priority(level: &Level) -> u8 {
+    match *level {
+        Level::ERROR => 3,
+        Level::WARN => 4,
+        Level::INFO => 6,
+        Level::DEBUG | Level::TRACE => 7,
+    }
+}
+
+impl<S, N, F> FormatEvent<S, N> for SyslogPrefix<F>
+where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+    N: for<'a> FormatFields<'a> + 'static,
+    F: FormatEvent<S, N>,
+{
+    fn format_event(
+        &self,
+        ctx: &FmtContext<'_, S, N>,
+        mut writer: Writer<'_>,
+        event: &Event<'_>,
+    ) -> std::fmt::Result {
+        if self.enabled {
+            write!(writer, "<{}>", syslog_priority(event.metadata().level()))?;
+        }
+        self.inner.format_event(ctx, writer, event)
+    }
+}
+
+/// systemd sets JOURNAL_STREAM to "<dev>:<ino>" of the journal stream, but children inherit it
+/// after redirecting stdout, so check it still names our stdout (systemd.exec(5)).
+fn stdout_is_journal() -> bool {
+    let Some(stream) = std::env::var_os("JOURNAL_STREAM") else {
+        return false;
+    };
+    let Ok(meta) = std::io::stdout()
+        .as_fd()
+        .try_clone_to_owned()
+        .and_then(|fd| std::fs::File::from(fd).metadata())
+    else {
+        return false;
+    };
+    stream.to_str() == Some(format!("{}:{}", meta.dev(), meta.ino()).as_str())
+}
 
 fn dotenvy_to_std_var(key: &str) -> anyhow::Result<String> {
     Ok(dotenvy::var(key)?)
@@ -43,7 +104,14 @@ fn main() -> anyhow::Result<()> {
 
     tracing_subscriber::registry()
         .with(EnvFilter::try_from_default_env().or_else(|_| EnvFilter::try_new("info"))?)
-        .with(fmt::layer().with_target(false).with_ansi(use_ansi))
+        .with(
+            fmt::layer()
+                .with_ansi(use_ansi)
+                .event_format(SyslogPrefix {
+                    enabled: stdout_is_journal(),
+                    inner: fmt::format().with_target(false),
+                }),
+        )
         .init();
 
     aws_lc_rs::default_provider()
@@ -106,4 +174,18 @@ fn main() -> anyhow::Result<()> {
     })?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn syslog_priority_matches_sd_daemon_levels() {
+        assert_eq!(syslog_priority(&Level::ERROR), 3);
+        assert_eq!(syslog_priority(&Level::WARN), 4);
+        assert_eq!(syslog_priority(&Level::INFO), 6);
+        assert_eq!(syslog_priority(&Level::DEBUG), 7);
+        assert_eq!(syslog_priority(&Level::TRACE), 7);
+    }
 }
