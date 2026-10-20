@@ -12,6 +12,7 @@ use rustls::crypto::aws_lc_rs;
 use std::io::IsTerminal;
 use std::os::fd::AsFd;
 use std::os::unix::fs::MetadataExt;
+use std::process::ExitCode;
 use tracing::Event;
 use tracing::Level;
 use tracing::Subscriber;
@@ -81,14 +82,47 @@ fn stdout_is_journal() -> bool {
     stream.to_str() == Some(format!("{}:{}", meta.dev(), meta.ino()).as_str())
 }
 
+/// Logs panics through tracing so journald records them at error priority; the default hook still
+/// prints the full message and backtrace afterwards.
+fn log_panics() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let payload = info.payload();
+        let msg = payload
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("Box<dyn Any>");
+        let location = info.location().map(ToString::to_string).unwrap_or_default();
+        tracing::error!("panicked at {location}: {msg}");
+        default_hook(info);
+    }));
+}
+
 fn dotenvy_to_std_var(key: &str) -> anyhow::Result<String> {
     Ok(dotenvy::var(key)?)
+}
+
+fn main() -> ExitCode {
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            // `{err:#}` keeps the whole anyhow chain on one line, so journald keeps its priority
+            if tracing::dispatcher::has_been_set() {
+                tracing::error!("{err:#}");
+            } else {
+                // failed before logging was initialized
+                eprintln!("Error: {err:?}");
+            }
+            ExitCode::FAILURE
+        }
+    }
 }
 
 // Index creating/querying is CPU bound task, so that vector-store uses rayon ThreadPool for them.
 // From the start there was no need (network traffic seems to be not so high) to support more than
 // one thread per network IO bound tasks.
-fn main() -> anyhow::Result<()> {
+fn run() -> anyhow::Result<()> {
     // Initialize logging early, before loading configuration, disable colors will be read twice
     let disable_colors: bool = dotenvy::var("VECTOR_STORE_DISABLE_COLORS")
         .unwrap_or("false".to_string())
@@ -101,6 +135,7 @@ fn main() -> anyhow::Result<()> {
     // Disable ANSI colors when explicitly requested or when stdout is not a terminal
     // (e.g. output is redirected to a file)
     let use_ansi = !disable_colors && std::io::stdout().is_terminal();
+    let journal = stdout_is_journal();
 
     tracing_subscriber::registry()
         .with(EnvFilter::try_from_default_env().or_else(|_| EnvFilter::try_new("info"))?)
@@ -108,11 +143,15 @@ fn main() -> anyhow::Result<()> {
             fmt::layer()
                 .with_ansi(use_ansi)
                 .event_format(SyslogPrefix {
-                    enabled: stdout_is_journal(),
+                    enabled: journal,
                     inner: fmt::format().with_target(false),
                 }),
         )
         .init();
+
+    if journal {
+        log_panics();
+    }
 
     aws_lc_rs::default_provider()
         .install_default()
